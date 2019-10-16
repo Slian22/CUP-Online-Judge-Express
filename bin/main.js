@@ -3,12 +3,16 @@ const ENVIRONMENT = process.env.NODE_ENV;
 require("../module/init/preinstall")();
 require("../module/init/build_env")();
 const config = global.config;
+const dash = require("appmetrics-dash");
+const dashConfig = require("../module/init/dash-config");
+dash.monitor(dashConfig);
 const easyMonitor = require("easy-monitor");
 easyMonitor("CUP Online Judge Express");
 require("debug")("express:server");
 const log4js = require("../module/logger");
 const logger = log4js.logger("normal", "info");
 const port = process.env.PORT || config.ws.client_port;
+const wsport = process.env.WSPORT || config.ws.judger_port;
 const query = require("../module/mysql_query");
 const cache_query = require("../module/mysql_cache");
 const cachePool = require("../module/cachePool");
@@ -26,9 +30,11 @@ const {solutionContainContestId, getSolutionInfo} = require("../module/solution/
 const {ConfigManager} = require("../module/config/config-manager");
 const localJudge = new LocalJudge(config.judger.oj_home, config.judger.oj_judge_num);
 const dockerRunner = new _dockerRunner(config.judger.oj_home, config.judger.oj_judge_num);
-const wss = new WebSocket.Server({port: config.ws.judger_port});
+const wss = new WebSocket.Server({port: wsport });
 const banCheaterModel = new BanCheaterModel();
+const ErrorCollector = require("../module/error/collector");
 const initExternalEnvironment = require("../module/init/InitExternalEnvironment");
+const SolutionUserCollector = require("../module/judger/SolutionUserCollector");
 const RuntimeErrorHandler = require("../module/judger/RuntimeErrorHandler");
 localJudge.setErrorHandler(new RuntimeErrorHandler());
 const databaseSubmissionCollector = require("../module/judger/DatabaseSubmissionCollector");
@@ -129,6 +135,7 @@ wss.on("connection", function (ws) {
 	/**
      * 绑定judger发送的事件
      */
+	ws.on("error", console.log);
 	ws.on("judger", async function (message) {
 		const solutionPack = message;
 		const finished = parseInt(solutionPack.finish);
@@ -163,6 +170,7 @@ wss.on("connection", function (ws) {
 		try {
 			request = JSON.parse(message);
 		} catch (e) {
+			ErrorCollector.push(__filename, e);
 			logger.fatal(`Error:\n
 			Error name:${e.name}\n
 			Error Message:${e.message}
@@ -198,18 +206,42 @@ server.listen(port, function () {
 function sendMessage(userArr, type, value, dimension = 2, privilege = false) {
 	if (dimension === 2) {
 		for (let i in userArr) {
-			if (!userArr.hasOwnProperty(i) || null === userArr[i]) {
-				continue;
+			try {
+				if (!userArr.hasOwnProperty(i) || null === userArr[i]) {
+					continue;
+				}
+				if (userArr[i] === undefined) {
+					delete userArr[i];
+					continue;
+				}
+			}
+			catch (e) {
+				ErrorCollector.push(__filename, {error: e, i, userArr});
+				console.log("i in userArr");
+				console.log("i", i);
+				console.log("userArr", userArr);
 			}
 			for (let j in userArr[i]) {
-				if (!userArr[i].hasOwnProperty(j) || null === userArr[i][j]) {
-					continue;
+				try {
+					if (!userArr[i].hasOwnProperty(j) || null === userArr[i][j]) {
+						continue;
+					}
+					if (userArr[i][j] === undefined) {
+						delete userArr[i][j];
+						continue;
+					}
+					if (userArr[i][j].url && userArr[i][j].url.indexOf("monitor") !== -1) {
+						continue;
+					}
+					if (!privilege || userArr[i][j].privilege) {
+						userArr[i][j].emit(type, value);
+					}
 				}
-				if (userArr[i][j].url && userArr[i][j].url.indexOf("monitor") !== -1) {
-					continue;
-				}
-				if (!privilege || userArr[i][j].privilege) {
-					userArr[i][j].emit(type, value);
+				catch (e) {
+					ErrorCollector.push(__filename, j, userArr[i]);
+					console.log("j in userArr[i]");
+					console.log("j", j);
+					console.log("userArr[i]", userArr[i]);
 				}
 			}
 		}
@@ -534,7 +566,7 @@ io.on("connection", async function (socket) {
 			socket.emit("reject_submit", response);
 			return;
 		}
-		data.submission_id = response.solution_id;
+		data.submission_id = data.solution_id = response.solution_id;
 		const ip = onlineUser[socket.user_id].ip;
 		const fingerprint = data.val.fingerprint;
 		const fingerprintRaw = data.val.fingerprintRaw;
@@ -590,6 +622,7 @@ io.on("connection", async function (socket) {
 			sendMessage(pagePush.status, "submit", data, 1);
 		}
 		const language = parseInt(data.val.language);
+		SolutionUserCollector.set(data.submission_id, data);
 		switch (language) {
 		case 15:
 		case 22:
