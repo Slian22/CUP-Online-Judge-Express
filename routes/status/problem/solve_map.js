@@ -3,6 +3,12 @@ const router = express.Router();
 const cache_query = require("../../../module/mysql_cache");
 const query = require("../../../module/mysql_query");
 const [error, ok] = require("../../../module/const_var");
+const interceptorMiddleware = require("../../../module/status/problem/SolveMapInterceptor");
+const dayjs = require("dayjs");
+const AwaitLock = require("await-lock").default;
+const lock = new AwaitLock();
+
+const solveMapCache = {};
 
 async function getUserList() {
 	return await cache_query("select user_id from users");
@@ -29,7 +35,7 @@ async function formatAcceptProblemToEdges(problem_list = [], problem_id) {
 		let prev_problem_id = parseInt(problem_list[i - 1].problem_id);
 		let current_problem_id = parseInt(problem_list[i].problem_id);
 		if (prev_problem_id !== current_problem_id) {
-		    if(!specific_problem || (specific_problem && (prev_problem_id === problem_id || current_problem_id === problem_id))) {
+			if (!specific_problem || (specific_problem && (prev_problem_id === problem_id || current_problem_id === problem_id))) {
 				result.push({from: problem_list[i - 1].problem_id, to: problem_list[i].problem_id});
 			}
 		}
@@ -78,16 +84,29 @@ function mergeSameEdges(Edges = []) {
 
 async function standardHandler(req, res, problem_id) {
 	try {
+		await lock.acquireAsync();
+		let cacheBody = solveMapCache[problem_id || "global"];
+		if (cacheBody) {
+			const prevTime = cacheBody.time;
+			if (dayjs().subtract(1, "day").isBefore(prevTime)) {
+				res.json(cacheBody.content);
+				return;
+			}
+		}
 		const userList = await getUserList();
 		const ACLists = await Promise.all(userList.map(user => getUserACList(user.user_id)));
 		const formattedEdges = await Promise.all(ACLists.map(list => formatAcceptProblemToEdges(list, problem_id)));
 		const edges = [];
 		formattedEdges.forEach(edgeList => edges.push(...edgeList));
 		const mergeEdges = mergeSameEdges(edges);
-		res.json(ok.okMaker(mergeEdges));
+		cacheBody = {content: ok.okMaker(mergeEdges), time: dayjs()};
+		solveMapCache[problem_id || "global"] = cacheBody;
+		res.json(cacheBody.content);
 	} catch (e) {
 		console.log(e);
 		res.json(error.database);
+	} finally {
+		lock.release();
 	}
 }
 
@@ -100,4 +119,4 @@ router.get("/", async (req, res) => {
 });
 
 
-module.exports = ["/solve_map", router];
+module.exports = ["/solve_map", interceptorMiddleware ,router];

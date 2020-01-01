@@ -3,7 +3,6 @@ const express = require("express");
 const dayjs = require("dayjs");
 //const NodeCache = require('node-cache');
 //const cache = new NodeCache({stdTTL: 10 * 24 * 60 * 60, checkperiod: 15 * 24 * 60 * 60});
-let cachePack = {};
 const website_dir = require("../config.json").website.dir;
 const bluebird = require("bluebird");
 const base64Img = bluebird.promisifyAll(require("base64-img"));
@@ -29,7 +28,10 @@ const auth = require("../middleware/auth");
 const cheerio = require("cheerio");
 const ENVIRONMENT = process.env.NODE_ENV;
 const path = require("path");
-const [error, ok] = require("../module/const_var");
+const ProblemInfoManager = require("../module/problem/ProblemInfoManager");
+const ProblemSetCachePool = require("../module/problemset/ProblemSetCachePool");
+const {error, ok} = require("../module/constants/state");
+require("../module/router_loader")(router, path.resolve(__dirname, "./problem"));
 
 
 const checkEmpty = (str) => {
@@ -77,8 +79,8 @@ const checkPrivilege = (req) => {
 };
 
 const checkProblemAvailable = async (problem_id) => {
-	const data = await cache_query("select defunct from problem where problem_id = ?", [problem_id]);
-	return !(!data || data.length === 0 || data[0].defunct === "Y");
+	const data = (await ProblemInfoManager.newInstance().setProblemId(problem_id).find()).get();
+	return !(!data || data.defunct === "Y");
 };
 
 
@@ -98,22 +100,25 @@ const maintainLabels = (vjudge) => {
 				}
 			}
 			const data = [...new Set(all_label)];
-			(async () => {
-				for (let i of data) {
-					await query(`INSERT INTO ${vjudge}label_list (label_name)
+			Promise.all(data.map(i => query(`INSERT INTO ${vjudge}label_list (label_name)
 SELECT * FROM (SELECT ?) AS tmp
 WHERE NOT EXISTS (
     SELECT label_name FROM ${vjudge}label_list WHERE label_name = ?
-) LIMIT 1;`, [i, i]);
-				}
-			})();
+) LIMIT 1;`, [i, i])));
 			return true;
 		}).catch(e => log(e));
 };
 
 async function problemCallbackHandler(opt, arr, val) {
 	const {req, res, copyVal} = val;
-	cache_query(opt.sql, arr).then((rows) => problem_callback(rows, req, res, opt, copyVal)).catch(e => log(e));
+	try {
+		const rows = await cache_query(opt.sql, arr);
+		problem_callback(rows, req, res, opt, copyVal);
+	}
+	catch (e) {
+		console.log(e);
+		res.json(error.internalError);
+	}
 }
 
 async function contestProblemHandler(httpInstance, val = {}) {
@@ -234,7 +239,7 @@ function prependAppendHandler(dataArray, opt) {
 const problem_callback = (rows, req, res, opt = {source: "", sid: -1, raw: false}, copyVal = {}) => {
 	let packed_problem = {};
 	if (rows.length !== 0) {
-		if (!opt.raw && (packed_problem = cachePack[opt.id])) {
+		/*if (!opt.raw && (packed_problem = cachePack[opt.id])) {
 			let _packed_problem = Object.assign({}, rows[0]);
 			_packed_problem.language_name = const_variable.language_name[opt.source.toLowerCase() || "local"];
 			_packed_problem.language_template = const_variable.language_template[opt.source.toLowerCase() || "local"];
@@ -244,14 +249,16 @@ const problem_callback = (rows, req, res, opt = {source: "", sid: -1, raw: false
 			_packed_problem.langmask = opt.langmask || const_variable.langmask;
 			cachePack[opt.id] = _packed_problem;
 		} else {
-			packed_problem = Object.assign({}, rows[0]);
-			packed_problem.language_name = const_variable.language_name[opt.source.toLowerCase() || "local"];
-			packed_problem.language_template = const_variable.language_template[opt.source.toLowerCase() || "local"];
-			packed_problem.prepend = opt.prepend;
-			packed_problem.append = opt.append;
-			packed_problem.uploader = opt.uploader;
-			packed_problem.langmask = opt.langmask || const_variable.langmask;
-		}
+
+		 */
+		packed_problem = Object.assign({}, rows[0]);
+		packed_problem.language_name = const_variable.language_name[opt.source.toLowerCase() || "local"];
+		packed_problem.language_template = const_variable.language_template[opt.source.toLowerCase() || "local"];
+		packed_problem.prepend = opt.prepend;
+		packed_problem.append = opt.append;
+		packed_problem.uploader = opt.uploader;
+		packed_problem.langmask = opt.langmask || const_variable.langmask;
+		// }
 		if (!opt.after_contest) {
 			packed_problem.source = "";
 		}
@@ -281,7 +288,7 @@ const problem_callback = (rows, req, res, opt = {source: "", sid: -1, raw: false
 				browse_code: req.session.source_browser,
 				editor: req.session.editor || false
 			}, copyVal));
-			cache.set("source/id/" + opt.source + opt.problem_id + opt.sql, packed_problem, 60 * 60);
+			// cache.set("source/id/" + opt.source + opt.problem_id + opt.sql, packed_problem, 60 * 60);
 		}
 	} else {
 		res.json(error.errorMaker("problem not found or not a public problem"));
@@ -297,7 +304,7 @@ function SemanticUIAPIHandler(req, res, key, promisify = false) {
 				res.json(error.errorMaker("Value too short!"));
 				return;
 			}
-			query(`SELECT * FROM problem WHERE ${(req.session.isadmin ? "" : " defunct='N' AND")} 
+			cache_query(`SELECT * FROM problem WHERE ${(req.session.isadmin ? "" : " defunct='N' AND")} 
 			 problem_id LIKE ? OR title LIKE ? OR source LIKE ? OR description LIKE ? OR label LIKE ?`, [val, val, val, val, val])
 				.then(rows => {
 					let result;
@@ -306,7 +313,7 @@ function SemanticUIAPIHandler(req, res, key, promisify = false) {
 						resolve(rows);
 					} else {
 						for (let i in rows) {
-							if (rows.hasOwnProperty(i)) {
+							if (Object.prototype.hasOwnProperty.call(rows, i)) {
 								rows[i]["url"] = "/newsubmitpage.php?id=" + rows[i]["problem_id"];// deprecated
 								rows[i].source = cheerio.load(rows[i].source).text();
 							}
@@ -340,7 +347,7 @@ router.get("/module/search/dropdown/:val", async (req, res) => {
 		const data = await SemanticUIAPIHandler(req, res, "/module/search/dropdown/", true);
 		const sendData = [];
 		for (let i in data) {
-			if (data.hasOwnProperty(i)) {
+			if (Object.prototype.hasOwnProperty.call(data, i)) {
 				sendData.push({
 					name: `Problem ${data[i].problem_id}: ${data[i].title}`,
 					value: parseInt(data[i].problem_id)
@@ -545,6 +552,8 @@ router.post("/:source/:id", function (req, res) {
 						logger.fatal(err);
 					}
 				});
+			ProblemInfoManager.newInstance().setProblemId(problem_id).removeCache();
+			ProblemSetCachePool.removeAll();
 			res.json(ok.ok);
 		} catch (e) {
 			logger.fatal(e);
@@ -558,7 +567,7 @@ router.post("/:source/:id", function (req, res) {
 async function getSourceCode(req, res, obj, opt = {}) {
 	opt = Object.assign({prefix: "", id: 0, sid: 0, source: "LOCAL"}, opt);
 	let {id, sid, source, prefix} = opt;
-	const rows2 = await query(`SELECT source,user_id FROM ${prefix}source_code WHERE solution_id=?`, [sid]);
+	const rows2 = await cache_query(`SELECT source,user_id FROM ${prefix}source_code WHERE solution_id=?`, [sid]);
 	const user_id = rows2[0].user_id;
 	if (!req.session.isadmin && user_id !== req.session.user_id) {
 		res.json(error.noprivilege);
@@ -576,13 +585,13 @@ router.get("/:source/:id/:sid", async function (req, res) {
 	const _res = cache.get("source/id/" + source + id + "/" + sid);
 	if (_res === undefined) {
 		if (source.length === 0) {
-			await getSourceCode(req, res, await query("SELECT * FROM problem WHERE problem_id=?", [id])[0], {
+			await getSourceCode(req, res, (await ProblemInfoManager.newInstance().setProblemId(id).find()).get(), {
 				id,
 				sid,
 				source
 			});
 		} else {
-			await getSourceCode(req, res, await query("SELECT * FROM vjudge_problem WHERE problem_id=? AND source=?",
+			await getSourceCode(req, res, await cache_query("SELECT * FROM vjudge_problem WHERE problem_id=? AND source=?",
 				[id, source])[0], {id, sid, source, prefix: "vjudge_"});
 		}
 	} else {
